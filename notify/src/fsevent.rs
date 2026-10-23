@@ -16,8 +16,8 @@
 
 use crate::paths::{absolute_path, reported_path};
 use crate::{
-    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Sender, Watcher,
-    unbounded,
+    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Sender,
+    WatchPathConfig, Watcher, unbounded,
 };
 use crate::{PathOp, event::*};
 use objc2_core_foundation as cf;
@@ -66,6 +66,9 @@ bitflags::bitflags! {
 
 const RUNLOOP_STOP_RECHECK_SECONDS: cf::CFTimeInterval = 0.5;
 
+/// The most paths `FSEventStreamSetExclusionPaths` takes for one stream.
+const MAX_EXCLUSIONS: usize = 8;
+
 /// FSEvents-based `Watcher` implementation
 pub struct FsEventWatcher {
     since_when: fs::FSEventStreamEventId,
@@ -84,6 +87,13 @@ struct WatchEntry {
     info: WatchInfo,
     cf_path: cf::CFRetained<cf::CFString>,
     device: u64,
+    exclusions: Vec<Exclusion>,
+}
+
+#[derive(Debug)]
+struct Exclusion {
+    canonical_path: PathBuf,
+    cf_path: cf::CFRetained<cf::CFString>,
 }
 
 #[derive(Clone, Debug)]
@@ -404,10 +414,11 @@ impl FsEventWatcher {
         })
     }
 
-    fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        let path = self.append_path(path, recursive_mode)?;
+    fn watch_inner(&mut self, path: &Path, config: &WatchPathConfig) -> Result<()> {
+        let path = self.append_path(path, config)?;
         let entry = &self.watches[&path];
         if self.is_covered(&path, entry.device)
+            && entry.exclusions.is_empty()
             && let Some(runloop) = &self.runloop
         {
             // The stream already delivers these events. Update the callback's path
@@ -439,7 +450,7 @@ impl FsEventWatcher {
 
         let result = crate::update_paths(ops, |op| match op {
             crate::PathOp::Watch(path, config) => self
-                .append_path(&path, config.recursive_mode())
+                .append_path(&path, &config)
                 .map(|_| ())
                 .map_err(|e| (PathOp::Watch(path, config), e)),
             crate::PathOp::Unwatch(path) => self
@@ -512,7 +523,7 @@ impl FsEventWatcher {
     }
 
     // https://github.com/thibaudgg/rb-fsevent/blob/master/ext/fsevent_watch/main.c
-    fn append_path(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<PathBuf> {
+    fn append_path(&mut self, path: &Path, config: &WatchPathConfig) -> Result<PathBuf> {
         if !path.exists() {
             return Err(Error::path_not_found().add_path(path.into()));
         }
@@ -528,19 +539,86 @@ impl FsEventWatcher {
         };
 
         let device = std::fs::metadata(&canonical_path)?.dev();
+        let exclusions = self.exclusions(path, &canonical_path, config.fsevent_exclusions())?;
 
         self.watches.insert(
             canonical_path.clone(),
             WatchEntry {
                 info: WatchInfo {
-                    is_recursive: recursive_mode.is_recursive(),
+                    is_recursive: config.recursive_mode().is_recursive(),
                     reported_path: path.to_path_buf(),
                 },
                 cf_path,
                 device,
+                exclusions,
             },
         );
         Ok(canonical_path)
+    }
+
+    // FSEvents matches exclusions against the real path, so each is resolved as the watched path
+    // is, through its nearest existing ancestor when the folder itself is not there yet.
+    fn exclusions(
+        &self,
+        path: &Path,
+        canonical_path: &Path,
+        folders: &[PathBuf],
+    ) -> Result<Vec<Exclusion>> {
+        let mut exclusions: Vec<Exclusion> = Vec::with_capacity(folders.len());
+        for folder in folders {
+            let folder = path.join(folder);
+            let resolved = resolve_missing(&folder)?;
+            let mut err: *mut cf::CFError = ptr::null_mut();
+            let Some(cf_path) = (unsafe { path_to_cfstring_ref(&resolved, &mut err) }) else {
+                if let Some(err) = NonNull::new(err) {
+                    let _ = unsafe { cf::CFRetained::from_raw(err) };
+                }
+                return Err(Error::path_not_found().add_path(folder));
+            };
+            if !resolved.starts_with(canonical_path) || resolved == canonical_path {
+                return Err(
+                    Error::generic("FSEvents exclusion is not under the watched path")
+                        .add_path(folder),
+                );
+            }
+            if !exclusions.iter().any(|e| e.canonical_path == resolved) {
+                exclusions.push(Exclusion {
+                    canonical_path: resolved,
+                    cf_path,
+                });
+            }
+        }
+        let mut all: Vec<&Path> = self
+            .watches
+            .iter()
+            .filter(|(watched, _)| watched.as_path() != canonical_path)
+            .flat_map(|(_, entry)| entry.exclusions.iter())
+            .chain(&exclusions)
+            .map(|e| e.canonical_path.as_path())
+            .collect();
+        all.sort();
+        all.dedup();
+        if all.len() > MAX_EXCLUSIONS {
+            return Err(Error::generic(&format!(
+                "FSEvents takes at most {MAX_EXCLUSIONS} exclusions per watcher, {} given",
+                all.len()
+            ))
+            .add_path(path.to_path_buf()));
+        }
+        Ok(exclusions)
+    }
+
+    // The exclusions of every watch, once each.
+    fn stream_exclusions(&self) -> cf::CFRetained<cf::CFMutableArray<cf::CFString>> {
+        let paths: cf::CFRetained<cf::CFMutableArray<cf::CFString>> = cf::CFMutableArray::empty();
+        let mut seen: Vec<&Path> = Vec::new();
+        for exclusion in self.watches.values().flat_map(|e| e.exclusions.iter()) {
+            if !seen.contains(&exclusion.canonical_path.as_path()) {
+                seen.push(&exclusion.canonical_path);
+                paths.append(&exclusion.cf_path);
+            }
+        }
+        paths
     }
 
     // A recursive watch covers nested watches on the same volume. Non-recursive
@@ -623,6 +701,19 @@ impl FsEventWatcher {
                 self.flags,
             )
         };
+
+        let exclusions = self.stream_exclusions();
+        if !exclusions.is_empty()
+            && !unsafe { fs::FSEventStreamSetExclusionPaths(stream, exclusions.as_opaque()) }
+        {
+            unsafe {
+                fs::FSEventStreamInvalidate(stream);
+                fs::FSEventStreamRelease(stream);
+            }
+            return Err(Error::generic(
+                "unable to set FSEvent stream exclusion paths",
+            ));
+        }
 
         // Wrapper to help send CFRunLoop types across threads.
         struct CFRunLoopSendWrapper(cf::CFRetained<cf::CFRunLoop>);
@@ -914,7 +1005,11 @@ impl Watcher for FsEventWatcher {
     }
 
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        self.watch_inner(path, recursive_mode)
+        self.watch_inner(path, &WatchPathConfig::new(recursive_mode))
+    }
+
+    fn watch_with(&mut self, path: &Path, config: WatchPathConfig) -> Result<()> {
+        self.watch_inner(path, &config)
     }
 
     fn unwatch(&mut self, path: &Path) -> Result<()> {
@@ -959,6 +1054,24 @@ impl Watcher for FsEventWatcher {
 impl Drop for FsEventWatcher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// `path` with every symlink resolved, through its nearest existing ancestor when it is not there.
+fn resolve_missing(path: &Path) -> Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = absolute_path(path)?;
+    loop {
+        match existing.canonicalize() {
+            Ok(real) => return Ok(missing.iter().rev().fold(real, |p, c| p.join(c))),
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name.to_owned());
+                    existing = parent.to_path_buf();
+                }
+                _ => return Err(Error::path_not_found().add_path(path.to_path_buf())),
+            },
+        }
     }
 }
 
@@ -1149,10 +1262,13 @@ mod tests {
         let mut watcher = FsEventWatcher::new(|_| {}, Config::default()).unwrap();
 
         watcher
-            .append_path(dir.path(), RecursiveMode::Recursive)
+            .append_path(dir.path(), &WatchPathConfig::new(RecursiveMode::Recursive))
             .expect("watch recursively");
         watcher
-            .append_path(dir.path(), RecursiveMode::NonRecursive)
+            .append_path(
+                dir.path(),
+                &WatchPathConfig::new(RecursiveMode::NonRecursive),
+            )
             .expect("rewatch non-recursively");
 
         let watched = watcher.watched_paths().expect("watched paths");
@@ -1176,7 +1292,9 @@ mod tests {
             (child.as_path(), RecursiveMode::NonRecursive),
             (grandchild.as_path(), RecursiveMode::Recursive),
         ] {
-            watcher.append_path(path, mode).expect("watch");
+            watcher
+                .append_path(path, &WatchPathConfig::new(mode))
+                .expect("watch");
         }
 
         assert_eq!(watcher.stream_paths().iter().count(), 1);
@@ -1201,10 +1319,10 @@ mod tests {
 
         let mut watcher = FsEventWatcher::new(|_| {}, Config::default()).unwrap();
         watcher
-            .append_path(&first, RecursiveMode::Recursive)
+            .append_path(&first, &WatchPathConfig::new(RecursiveMode::Recursive))
             .expect("watch first");
         watcher
-            .append_path(&second, RecursiveMode::Recursive)
+            .append_path(&second, &WatchPathConfig::new(RecursiveMode::Recursive))
             .expect("watch second");
 
         assert_eq!(watcher.stream_paths().iter().count(), 2);
@@ -2147,6 +2265,102 @@ mod tests {
     // (https://github.com/fsnotify/fsevents/issues/48). That path count is exactly what
     // closes fd 0, so the test corrupted the process it ran in and needed a `catch_unwind`
     // around its own cleanup to stay green.
+    fn watch_excluding(watcher: &mut TestWatcher<FsEventWatcher>, path: &Path, folders: &[&str]) {
+        let config = WatchPathConfig::new(RecursiveMode::Recursive)
+            .with_fsevent_exclusions(folders.iter().map(|f| path.join(f)).collect());
+        watcher
+            .watcher
+            .watch_with(path, config)
+            .expect("watch_with");
+    }
+
+    #[test]
+    fn exclusions_hide_a_folder_made_after_the_watch_starts() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher();
+        watch_excluding(&mut watcher, tmpdir.path(), &["target"]);
+
+        std::fs::create_dir_all(tmpdir.path().join("target/debug")).expect("create_dir_all");
+        std::fs::write(tmpdir.path().join("target/debug/out"), b"1").expect("write");
+        let kept = tmpdir.path().join("kept");
+        std::fs::File::create_new(&kept).expect("create");
+
+        let events: Vec<Event> = rx.iter().collect();
+        let paths: Vec<&PathBuf> = events.iter().flat_map(|e| &e.paths).collect();
+        assert!(paths.iter().any(|p| p.ends_with("kept")), "{paths:#?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with(tmpdir.path().join("target/debug"))),
+            "{paths:#?}"
+        );
+    }
+
+    #[test]
+    fn exclusions_resolve_symlinks_like_the_watched_path() {
+        let tmpdir = testdir();
+        let link = tmpdir.path().join("link");
+        let real = tmpdir.path().join("real");
+        std::fs::create_dir(&real).expect("create_dir");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let (mut watcher, mut rx) = watcher();
+        watch_excluding(&mut watcher, &link, &["target"]);
+
+        std::fs::create_dir_all(link.join("target/debug")).expect("create_dir_all");
+        std::fs::write(link.join("target/debug/out"), b"1").expect("write");
+        std::fs::File::create_new(link.join("kept")).expect("create");
+
+        let events: Vec<Event> = rx.iter().collect();
+        let paths: Vec<&PathBuf> = events.iter().flat_map(|e| &e.paths).collect();
+        assert!(paths.iter().any(|p| p.ends_with("kept")), "{paths:#?}");
+        assert!(!paths.iter().any(|p| p.ends_with("out")), "{paths:#?}");
+    }
+
+    #[test]
+    fn refuses_an_exclusion_outside_the_watched_path() {
+        let tmpdir = testdir();
+        let watched = tmpdir.path().join("watched");
+        std::fs::create_dir(&watched).expect("create_dir");
+        let (mut watcher, _rx) = watcher();
+
+        let config = WatchPathConfig::new(RecursiveMode::Recursive)
+            .with_fsevent_exclusions(vec![tmpdir.path().join("elsewhere")]);
+        let err = watcher
+            .watcher
+            .watch_with(&watched, config)
+            .expect_err("an exclusion outside the watch must fail");
+        assert!(matches!(err.kind, ErrorKind::Generic(_)), "{err:?}");
+        assert!(watcher.watcher.watches.is_empty());
+    }
+
+    #[test]
+    fn refuses_more_exclusions_than_fsevents_takes() {
+        let tmpdir = testdir();
+        let (mut watcher, _rx) = watcher();
+        let first = tmpdir.path().join("first");
+        let second = tmpdir.path().join("second");
+        std::fs::create_dir(&first).expect("create_dir");
+        std::fs::create_dir(&second).expect("create_dir");
+
+        watch_excluding(&mut watcher, &first, &["a", "b", "c", "d", "e"]);
+        let config = WatchPathConfig::new(RecursiveMode::Recursive).with_fsevent_exclusions(
+            ["a", "b", "c", "d"]
+                .iter()
+                .map(|f| second.join(f))
+                .collect(),
+        );
+        let err = watcher
+            .watcher
+            .watch_with(&second, config)
+            .expect_err("nine exclusions on one watcher must fail");
+        assert!(
+            matches!(&err.kind, ErrorKind::Generic(m) if m.contains("at most 8")),
+            "{err:?}"
+        );
+        assert_eq!(watcher.watcher.watches.len(), 1);
+    }
+
     #[test]
     fn refuses_more_paths_than_fsevents_can_carry() {
         let budget = fsevents_path_budget().expect("path budget");

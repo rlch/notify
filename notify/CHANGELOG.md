@@ -2,6 +2,7 @@
 
 ## unreleased
 
+- FEATURE: [macOS] add `WatchPathConfig::with_fsevent_exclusions` to leave folders under a watch out of its FSEvents stream (`FSEventStreamSetExclusionPaths`), at most 8 per watcher
 ## notify 9.0.0-rc.6 (2026-10-17)
 
 - FIX: [macOS] prevent intermittent hangs during rapid watch/unwatch sequences with `FsEventWatcher` [#1013]
